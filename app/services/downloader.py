@@ -94,54 +94,190 @@ class DownloadManager:
 
     async def initialize(self):
         """Load saved downloads and resume interrupted ones"""
-        await self.load_downloads()
-        await self.load_bandwidth_settings()
+        # Set up backup recovery in case of data corruption
+        try:
+            await self.load_downloads()
+            await self.load_bandwidth_settings()
+        except Exception as e:
+            print(f"Error loading saved downloads: {e}")
+            # Try to recover from backup files
+            try:
+                print("Attempting to recover from backup files...")
+                # Look for backup files
+                storage_dir = os.path.dirname(self.storage_file)
+                backup_files = [f for f in os.listdir(storage_dir) if f.endswith('.bak') and f.startswith(os.path.basename(self.storage_file))]
+                
+                if backup_files:
+                    # Sort by modification time (newest first)
+                    backup_files.sort(key=lambda f: os.path.getmtime(os.path.join(storage_dir, f)), reverse=True)
+                    latest_backup = os.path.join(storage_dir, backup_files[0])
+                    print(f"Found backup file: {latest_backup}")
+                    
+                    # Replace the corrupted file with the backup
+                    import shutil
+                    shutil.copy2(latest_backup, self.storage_file)
+                    print(f"Restored from backup: {latest_backup}")
+                    
+                    # Try loading again
+                    await self.load_downloads()
+                else:
+                    print("No backup files found. Starting with empty downloads list.")
+                    self.downloads = {}
+            except Exception as recovery_error:
+                print(f"Error recovering from backup: {recovery_error}")
+                print("Starting with empty downloads list.")
+                self.downloads = {}
+            
+            # Always try to load bandwidth settings, even if downloads failed
+            try:
+                await self.load_bandwidth_settings()
+            except:
+                print("Error loading bandwidth settings. Using defaults.")
+
+        # Create a backup of the current state after successful load
+        try:
+            if os.path.exists(self.storage_file):
+                backup_path = f"{self.storage_file}.{int(time.time())}.bak"
+                import shutil
+                shutil.copy2(self.storage_file, backup_path)
+                
+                # Clean up old backups (keep only the 5 most recent)
+                storage_dir = os.path.dirname(self.storage_file)
+                backup_files = [f for f in os.listdir(storage_dir) if f.endswith('.bak') and f.startswith(os.path.basename(self.storage_file))]
+                if len(backup_files) > 5:
+                    backup_files.sort(key=lambda f: os.path.getmtime(os.path.join(storage_dir, f)))
+                    for old_backup in backup_files[:-5]:
+                        try:
+                            os.remove(os.path.join(storage_dir, old_backup))
+                        except:
+                            pass
+        except Exception as backup_error:
+            print(f"Error creating backup: {backup_error}")
 
         # Check for partially downloaded files and resume them
         downloads_to_resume = []
-        for download_id, download in self.downloads.items():
+        downloads_to_check = list(self.downloads.items())
+        
+        for download_id, download in downloads_to_check:
             # Only resume downloads that were in progress
             if download.status in [
                 DownloadStatus.DOWNLOADING,
                 DownloadStatus.QUEUED,
                 DownloadStatus.PAUSED,
             ]:
-                # Check if the file exists but is incomplete
-                if os.path.exists(download.save_path):
-                    current_size = os.path.getsize(download.save_path)
-                    if download.size and current_size < download.size:
-                        # Update size_downloaded to match what's on disk
-                        download.size_downloaded = current_size
-                        download.status = DownloadStatus.PAUSED
-                        downloads_to_resume.append(download_id)
-                    elif current_size > 0 and download.size is None:
-                        # We don't know the full size, but there's partial data
-                        download.size_downloaded = current_size
-                        download.status = DownloadStatus.PAUSED
-                        downloads_to_resume.append(download_id)
+                try:
+                    # Verify save_path is valid before attempting to access
+                    if not download.save_path or not isinstance(download.save_path, str):
+                        print(f"Warning: Invalid save path for download {download_id}. Setting to default location.")
+                        # Set a default location based on the download name or ID
+                        filename = download.name if download.name else f"download_{download_id}"
+                        download.save_path = os.path.join(self.download_dir, filename)
+                    
+                    # Make sure the parent directory exists
+                    os.makedirs(os.path.dirname(download.save_path), exist_ok=True)
+                    
+                    # Check if the file exists but is incomplete
+                    if os.path.exists(download.save_path):
+                        try:
+                            current_size = os.path.getsize(download.save_path)
+                            
+                            # If file is accessible, check its integrity
+                            try:
+                                # Try to open the file to verify it's not locked or corrupted
+                                with open(download.save_path, "rb") as f:
+                                    # Just read a small chunk to check access
+                                    f.seek(0)
+                                    f.read(1)
+                                    
+                                    # If size is known, try to read from the end to ensure integrity
+                                    if current_size > 1024:  # Only for files > 1KB
+                                        f.seek(max(0, current_size - 1024))
+                                        f.read(1024)
+                                
+                                # File is accessible, proceed with normal checks
+                                if download.size and current_size < download.size:
+                                    # Update size_downloaded to match what's on disk
+                                    download.size_downloaded = current_size
+                                    download.status = DownloadStatus.PAUSED
+                                    downloads_to_resume.append(download_id)
+                                elif current_size > 0 and download.size is None:
+                                    # We don't know the full size, but there's partial data
+                                    download.size_downloaded = current_size
+                                    download.status = DownloadStatus.PAUSED
+                                    downloads_to_resume.append(download_id)
+                                elif download.size and current_size > download.size:
+                                    # File on disk is larger than expected, might be corrupted or a different file
+                                    print(f"Warning: File {download.save_path} for {download_id} is larger ({current_size}) than expected ({download.size}). Marking as failed.")
+                                    download.status = DownloadStatus.FAILED
+                                    download.notes = f"File on disk ({current_size} bytes) is larger than metadata size ({download.size} bytes). Download marked as failed."
+                                elif current_size == 0 and download.size_downloaded > 0:
+                                    # If metadata says downloaded but file is 0 bytes
+                                    print(f"Warning: File {download.save_path} for {download_id} is 0 bytes but metadata shows {download.size_downloaded} downloaded. Resetting and queuing.")
+                                    download.size_downloaded = 0
+                                    download.status = DownloadStatus.QUEUED
+                                    downloads_to_resume.append(download_id)
+                                else:
+                                    # Covers current_size == 0 and current_size == download.size (if not completed)
+                                    # File exists but is empty or complete, determine status
+                                    if download.size and current_size >= download.size:
+                                        # File is complete
+                                        download.status = DownloadStatus.COMPLETED
+                                        download.size_downloaded = download.size
+                                    else:
+                                        # File is empty or we don't know the size, queue it
+                                        download.size_downloaded = current_size
+                                        download.status = DownloadStatus.QUEUED
+                                        downloads_to_resume.append(download_id)
+                            
+                            except (IOError, PermissionError) as file_access_error:
+                                print(f"Warning: File {download.save_path} for {download_id} exists but may be locked or corrupted: {file_access_error}. Requeuing.")
+                                # File exists but couldn't be accessed properly
+                                download.status = DownloadStatus.QUEUED
+                                # Keep current size_downloaded but flag for restart
+                                downloads_to_resume.append(download_id)
+                        
+                        except OSError as e:
+                            print(f"Error getting file size for {download.save_path}: {e}. Requeuing download.")
+                            download.status = DownloadStatus.QUEUED
+                            downloads_to_resume.append(download_id)
                     else:
-                        # File doesn't exist or is empty, mark as queued
+                        # File doesn't exist, mark as queued
                         download.size_downloaded = 0
                         download.status = DownloadStatus.QUEUED
                         downloads_to_resume.append(download_id)
-                else:
-                    # File doesn't exist, mark as queued
-                    download.size_downloaded = 0
-                    download.status = DownloadStatus.QUEUED
-                    downloads_to_resume.append(download_id)
+                
+                except OSError as e:
+                    print(f"Error accessing file {download.save_path} for download {download_id} during resume: {e}. Marking as failed.")
+                    download.status = DownloadStatus.FAILED
+                    download.notes = f"Error during file check on resume: {e}"
+                
+                except Exception as e:
+                    print(f"Unexpected error processing download {download_id} for resume: {e}. Marking as failed.")
+                    download.status = DownloadStatus.FAILED
+                    download.notes = f"Unexpected error on resume: {e}"
+                    import traceback
+                    traceback.print_exc()
 
+        # Update download state before resuming
+        await self.save_downloads()
+        
         # Resume downloads that were interrupted
         for download_id in downloads_to_resume:
             if (
                 download_id in self.downloads
                 and self.downloads[download_id].status != DownloadStatus.SCHEDULED
             ):
-                if self.downloads[download_id].is_youtube:
-                    self.tasks[download_id] = asyncio.create_task(
-                        self._download_youtube(download_id)
-                    )
-                else:
-                    self.tasks[download_id] = asyncio.create_task(self._download_file(download_id))
+                try:
+                    if self.downloads[download_id].is_youtube:
+                        self.tasks[download_id] = asyncio.create_task(
+                            self._download_youtube(download_id)
+                        )
+                    else:
+                        self.tasks[download_id] = asyncio.create_task(self._download_file(download_id))
+                except Exception as e:
+                    print(f"Error resuming download {download_id}: {e}")
+                    self.downloads[download_id].status = DownloadStatus.FAILED
+                    self.downloads[download_id].notes = f"Error starting download task: {e}"
 
         print(
             f"Restored {len(self.downloads)} downloads, resumed {len(downloads_to_resume)} downloads"
@@ -155,16 +291,43 @@ class DownloadManager:
 
         return len(downloads_to_resume)
 
-    def _start_autosave(self, interval_seconds: int = 30):
+    def _start_autosave(self, interval_seconds: int = 5):
         """Start an automatic save task to run periodically"""
 
         async def autosave_task():
             while True:
-                await asyncio.sleep(interval_seconds)
-                await self.save_downloads()
-                await self.save_bandwidth_settings()
+                try:
+                    await asyncio.sleep(interval_seconds)
+                    
+                    # Save downloads with active ones first to prioritize their state
+                    active_downloads_exist = any(
+                        download.status == DownloadStatus.DOWNLOADING
+                        for download in self.downloads.values()
+                    )
+                    
+                    # More frequent saves if there are active downloads
+                    if active_downloads_exist:
+                        # Save immediately and then set a shorter interval for next save
+                        await self.save_downloads()
+                        await self.save_bandwidth_settings()
+                        await asyncio.sleep(interval_seconds // 2)  # Half interval for active downloads
+                    else:
+                        # Normal save for inactive state
+                        await self.save_downloads()
+                        await self.save_bandwidth_settings()
+                except Exception as e:
+                    print(f"Error in autosave task: {e}")
+                    # Don't let exceptions stop the autosave - log and continue
+                    import traceback
+                    traceback.print_exc()
+                    # Shorter sleep after error to try again quickly
+                    await asyncio.sleep(interval_seconds // 2)
 
-        asyncio.create_task(autosave_task())
+        # Create the autosave task with a name for better debugging
+        autosave_task_obj = asyncio.create_task(autosave_task(), name="download_autosave_task")
+        
+        # Store reference to the task so it doesn't get garbage collected
+        self._autosave_task = autosave_task_obj
 
     def _start_scheduler(self, check_interval_seconds: int = 60):
         """Start the scheduler for scheduled downloads"""
@@ -701,9 +864,10 @@ class DownloadManager:
         # Apply the new speed limits
         for download_id in active_downloads:
             download = self.downloads[download_id]
-            if download.pause_resume_callback:
-                # Let the download know its speed has changed
-                await download.pause_resume_callback(paused=False)
+            # download.max_speed has already been set by the logic above
+            # Instead of calling the callback, set a flag to signal the download task
+            download.needs_rate_limit_update = True
+            # The download task itself will pick this up and re-initialize its rate limiter.
 
     def _detect_category(self, filename: str) -> FileCategory:
         """Detect file category based on filename and extension"""
@@ -1175,7 +1339,40 @@ class DownloadManager:
         return download
 
     async def _download_file(self, download_id: str) -> None:
-        """Download a file from a URL"""
+        """
+        Download a file with automatic selection between chunked and regular methods.
+        This method decides whether to use parallel chunking or regular single connection.
+        """
+        download = self.downloads.get(download_id)
+        if not download:
+            print(f"Download {download_id} not found")
+            return
+        
+        # Try to get file size information first if not already known
+        if not download.size:
+            try:
+                name, size = await self.get_file_info(str(download.url))
+                if name and not download.name.startswith("download_"):
+                    download.name = name
+                    download.save_path = os.path.join(os.path.dirname(download.save_path), name)
+                if size:
+                    download.size = size
+            except Exception as e:
+                print(f"Error getting file info: {e}")
+        
+        # Determine whether to use chunked download
+        # Files over 10MB will use chunked download
+        min_size_for_chunking = 10 * 1024 * 1024  # 10MB
+        
+        if download.size and download.size >= min_size_for_chunking:
+            print(f"Using parallel chunked download for {download_id} ({download.size} bytes)")
+            await self._download_file_chunked(download_id)
+        else:
+            print(f"Using regular download for {download_id}")
+            await self._download_file_regular(download_id)
+        
+    async def _download_file_regular(self, download_id: str) -> None:
+        """Download a file using the original single-connection method."""
         download = self.downloads.get(download_id)
         if not download:
             print(f"Download {download_id} not found")
@@ -1224,6 +1421,8 @@ class DownloadManager:
         # Retry loop for the download
         retry_count = 0
         max_retries = download.max_retries
+        current_url_to_try = str(download.url) # Initialize with the original URL
+        attempted_protocol_switch = False # Flag to ensure we only switch protocol once
 
         while retry_count <= max_retries:
             try:
@@ -1240,10 +1439,13 @@ class DownloadManager:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     headers = {}
                     if initial_size > 0:
-                        # Resume download from where we left off
                         headers["Range"] = f"bytes={initial_size}-"
 
-                    async with session.get(str(download.url), headers=headers) as response:
+                    # Use current_url_to_try for the GET request
+                    async with session.get(current_url_to_try, headers=headers) as response:
+                        # Raise an HTTPError for bad responses (4xx or 5xx)
+                        response.raise_for_status()
+
                         # Check if the server supports resume
                         if initial_size > 0 and response.status != 206:
                             # Server doesn't support resuming, start from the beginning
@@ -1285,8 +1487,10 @@ class DownloadManager:
                             pause_event.set()  # Not paused initially
 
                             # Variable for rate limiting
-                            rate_limit = None
+                            # Initialize rate_limit based on current download.max_speed
+                            rate_limit = download.max_speed if download.max_speed else None
                             last_chunk_time = datetime.now()
+                            download.needs_rate_limit_update = False # Clear flag as we're setting rate_limit now
 
                             # Set up pause/resume callback function
                             async def pause_resume_callback(paused: bool = None):
@@ -1360,6 +1564,14 @@ class DownloadManager:
                                 async for chunk in response.content.iter_chunked(chunk_size):
                                     # Check if we should pause
                                     await pause_event.wait()
+
+                                    # Update rate_limit if signaled by an external change (e.g., recalculate_bandwidth)
+                                    if download.needs_rate_limit_update:
+                                        new_max_speed = download.max_speed if download.max_speed else None
+                                        if rate_limit != new_max_speed:
+                                            rate_limit = new_max_speed
+                                            print(f"Download {download_id}: Internal rate_limit updated to {rate_limit} due to flag.")
+                                        download.needs_rate_limit_update = False # Reset the flag
 
                                     # Check if we've been cancelled
                                     if download.status == DownloadStatus.FAILED:
@@ -1437,11 +1649,10 @@ class DownloadManager:
                                         last_size = download.size_downloaded
 
                             except asyncio.CancelledError:
-                                print(f"Download {download_id} was cancelled")
-                                # Just exit the function, the download status is already set
-                                download.pause_resume_callback = None
-                                download.cancel_callback = None
-                                # Recalculate bandwidth allocation
+                                print(f"Download {download_id} cancelled.")
+                                download.status = DownloadStatus.FAILED # Or some other appropriate status
+                                download.notes = "Download was cancelled."
+                                await self.save_and_broadcast_download(download_id, "cancel")
                                 await self._recalculate_bandwidth_allocation()
                                 return
                             except TimeoutError as e:
@@ -1526,57 +1737,510 @@ class DownloadManager:
                             )
                             return
 
-            except aiohttp.ClientError as e:
-                print(f"Download error: {e}")
-                retry_count += 1
-                if retry_count <= max_retries:
-                    print(f"Retrying download {download_id} (attempt {retry_count}/{max_retries})")
-                    await asyncio.sleep(2**retry_count)  # Exponential backoff
-                else:
-                    # All retries failed
-                    download.status = DownloadStatus.FAILED
-                    download.pause_resume_callback = None
-                    download.cancel_callback = None
-                    await self.save_and_broadcast_download(download_id, "error")
+            except asyncio.CancelledError:
+                print(f"Download {download_id} cancelled.")
+                download.status = DownloadStatus.FAILED # Or some other appropriate status
+                download.notes = "Download was cancelled."
+                await self.save_and_broadcast_download(download_id, "cancel")
+                await self._recalculate_bandwidth_allocation()
+                return
 
-                    # Check if this was a scheduled download that should be retried
-                    if (
-                        download.schedule
-                        and download.schedule.retry_on_failure
-                        and download.schedule.current_schedule_retries
-                        < download.schedule.max_schedule_retries
-                    ):
-                        # Add to failed scheduled downloads for retry
-                        retry_time = datetime.now() + timedelta(
-                            minutes=download.schedule.retry_delay_minutes
-                        )
-                        self.scheduler_failed_downloads[download_id] = {
-                            "retry_time": retry_time,
-                            "attempts": download.schedule.current_schedule_retries,
-                        }
+            except aiohttp.ClientError as e: # Covers ClientResponseError, ClientConnectionError, etc.
+                error_message = f"Download error for {download_id} on URL {current_url_to_try}: {e}"
+                if isinstance(e, aiohttp.ClientResponseError):
+                    error_message = f"HTTP error for {download_id} on URL {current_url_to_try}: {e.status} {e.message}"
+                    # Specific handling for 416 Range Not Satisfiable
+                    if e.status == 416 and initial_size > 0:
+                        print(f"Got 416 Range Not Satisfiable for {download_id}. Resetting download from beginning.")
+                        initial_size = 0
+                        download.size_downloaded = 0
+                        download.notes = f"Reset due to 416 error on {current_url_to_try}."
+                        if os.path.exists(download.save_path):
+                            try:
+                                async with aiofiles.open(download.save_path, "wb") as f_truncate:
+                                    await f_truncate.truncate(0)
+                            except Exception as fe:
+                                print(f"Error truncating file {download.save_path}: {fe}")
+                        await self.save_and_broadcast_download(download_id)
+                        continue # Retry immediately with initial_size = 0 for the same URL
 
-                        # Send notification about retry
-                        await self._send_notification(
-                            download_id,
-                            "Scheduled Download Failed",
-                            f"The download '{download.name}' failed. Retrying in {download.schedule.retry_delay_minutes} minutes.",
-                            "warning",
-                        )
+                print(error_message)
+                download.notes = error_message
+
+                # Attempt HTTP to HTTPS fallback
+                parsed_url = urlparse(current_url_to_try)
+                if parsed_url.scheme == "http" and not attempted_protocol_switch:
+                    print(f"HTTP download for {download_id} failed ({type(e).__name__}). Attempting HTTPS.")
+                    current_url_to_try = urlunparse(parsed_url._replace(scheme="https"))
+                    attempted_protocol_switch = True
+                    initial_size = 0 # Reset progress for new protocol
+                    download.size_downloaded = 0
+                    download.notes = f"Switched to HTTPS after {type(e).__name__}. Previous error: {e}"
+                    await self.save_and_broadcast_download(download_id)
+                    # Don't increment retry_count for this specific failure, continue to try new URL
+                    continue
+                # HTTPS to HTTP fallback
+                elif parsed_url.scheme == "https" and not attempted_protocol_switch:
+                    print(f"HTTPS download for {download_id} failed ({type(e).__name__}). Attempting HTTP.")
+                    current_url_to_try = urlunparse(parsed_url._replace(scheme="http"))
+                    attempted_protocol_switch = True
+                    initial_size = 0 # Reset progress for new protocol
+                    download.size_downloaded = 0
+                    download.notes = f"Switched to HTTP after {type(e).__name__}. Previous error: {e}"
+                    await self.save_and_broadcast_download(download_id)
+                    # Don't increment retry_count for this specific failure, continue to try new URL
+                    continue
+
+            except Exception as e:
+                print(f"Unexpected download error for {download_id} on {current_url_to_try}: {e}")
+                import traceback
+                traceback.print_exc()
+                download.notes = f"Unexpected error on {current_url_to_try}: {e}"
+
+            # If we are here, an error occurred that wasn't handled by a 'continue' (like protocol switch or 416)
+            retry_count += 1
+            download.retry_count = retry_count
+            if retry_count <= max_retries:
+                await self.save_and_broadcast_download(download_id)
+                retry_delay = min(2**retry_count, 60)  # Exponential backoff with a cap, e.g., 60s
+                print(f"Retrying download {download_id} ({retry_count}/{max_retries}) for {current_url_to_try} in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                print(f"Download {download_id} failed after {max_retries} retries on {current_url_to_try}.")
+                download.status = DownloadStatus.FAILED
+                # Ensure notes reflect the final URL tried and the number of retries
+                final_note = f"Failed after {max_retries} retries. Last URL tried: {current_url_to_try}. Last error: {download.notes}"
+                if download.notes and str(e) not in download.notes: # Append if distinct
+                     final_note = f"Failed after {max_retries} retries on {current_url_to_try}. Last error before final retry: {download.notes}. Final error: {e}"
+                elif not download.notes:
+                    final_note = f"Failed after {max_retries} retries on {current_url_to_try}. Error: {e}"
+                download.notes = final_note[:500] # Truncate notes if too long
+
+                await self.save_and_broadcast_download(download_id)
+
+    async def _download_file_chunked(self, download_id: str, chunks: int = 4, min_chunk_size: int = 5242880) -> None:
+        """
+        Download a file in parallel chunks for improved speed
+        
+        Args:
+            download_id: The ID of the download
+            chunks: Number of chunks to split the file into (default: 4)
+            min_chunk_size: Minimum size per chunk in bytes (default: 5MB)
+        """
+        download = self.downloads.get(download_id)
+        if not download:
+            print(f"Download {download_id} not found")
+            return
+
+        # Ensure we have a file size for chunking
+        if not download.size:
+            print(f"Cannot use chunked download for {download_id} - file size unknown")
+            # Fall back to regular download
+            await self._download_file_regular(download_id)
+            return
+
+        # Verify the file size is large enough to justify chunking
+        if download.size < min_chunk_size * 2:
+            print(f"File too small for chunked download ({download.size} bytes), using regular download")
+            await self._download_file_regular(download_id)
+            return
+
+        # Create parent directory if it doesn't exist
+        os.makedirs(os.path.dirname(download.save_path), exist_ok=True)
+
+        # Check if this is resuming a previously paused chunked download
+        resuming_chunked = False
+        temp_dir = None
+        
+        if download.status == DownloadStatus.PAUSED and hasattr(download, '_chunked_download_state'):
+            try:
+                # Get saved state data
+                saved_state = download._chunked_download_state
+                if saved_state and 'temp_dir' in saved_state and 'chunk_boundaries' in saved_state:
+                    temp_dir = saved_state['temp_dir']
+                    chunk_boundaries = saved_state['chunk_boundaries']
+                    saved_progress = saved_state.get('chunk_progress', [])
+                    
+                    # Verify temp dir still exists
+                    if os.path.isdir(temp_dir):
+                        print(f"Resuming chunked download with {len(chunk_boundaries)} chunks from temp dir: {temp_dir}")
+                        resuming_chunked = True
                     else:
-                        # Send standard error notification
-                        await self._send_notification(
-                            download_id,
-                            "Download Failed",
-                            f"The download '{download.name}' failed after {max_retries} retries: {str(e)}",
-                            "error",
-                        )
+                        print(f"Temp directory {temp_dir} no longer exists, will start new chunked download")
+                        temp_dir = None
+            except Exception as e:
+                print(f"Error checking saved chunked state: {e}")
+                # Will fall back to starting a new chunked download
+                
+        # Check if we can resume from existing file
+        if not resuming_chunked:
+            if os.path.exists(download.save_path):
+                try:
+                    current_size = os.path.getsize(download.save_path)
+                    if current_size >= download.size:
+                        # File is already complete
+                        download.size_downloaded = download.size
+                        download.status = DownloadStatus.COMPLETED
+                        await self.save_and_broadcast_download(download_id)
+                        return
+                    elif current_size > 0:
+                        # File exists but is incomplete - we'll restart the chunked download
+                        print(f"Found partial download of {current_size} bytes, but restarting for chunked method")
+                        # We won't set download.size_downloaded here because we'll be using a different tracking method
+                except (OSError, FileNotFoundError) as e:
+                    print(f"Error checking existing file: {e}")
 
-                    # Recalculate bandwidth allocation
+        # Test if server supports byte range requests (only if not resuming with existing chunks)
+        if not resuming_chunked:
+            supports_range = False
+            current_url_to_try = str(download.url)
+            attempted_protocol_switch = False
+            
+            async with aiohttp.ClientSession() as session:
+                try:
+                    # Try a small range request to test server support
+                    headers = {"Range": "bytes=0-1"}
+                    async with session.get(current_url_to_try, headers=headers) as response:
+                        supports_range = response.status == 206  # Partial Content response
+                except Exception as e:
+                    print(f"Error testing range support: {e}")
+            
+            if not supports_range:
+                print(f"Server does not support byte range requests for {download_id}, using regular download")
+                await self._download_file_regular(download_id)
+                return
+
+            # Determine chunk size and count
+            file_size = download.size
+            optimal_chunk_size = max(min_chunk_size, file_size // chunks)
+            
+            # Calculate chunk boundaries
+            chunk_boundaries = []
+            for i in range(chunks):
+                start = i * optimal_chunk_size
+                end = min(start + optimal_chunk_size - 1, file_size - 1)
+                if start > end:
+                    break  # Skip empty chunks
+                chunk_boundaries.append((start, end))
+        
+        # Set up tracking variables
+        download.status = DownloadStatus.DOWNLOADING
+        if not resuming_chunked:
+            download.size_downloaded = 0
+        
+        # Set up pause/resume handling
+        pause_event = asyncio.Event()
+        pause_event.set()  # Start in unpaused state
+        
+        # Create a temporary directory for chunks if not resuming
+        if not temp_dir:
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix=f"download_{download_id}_")
+        
+        # Set up pause/resume callback function
+        async def pause_resume_callback(paused: bool = None):
+            nonlocal chunk_progress, temp_dir
+            
+            if paused is None:
+                # Toggle pause state
+                if pause_event.is_set():
+                    pause_event.clear()
+                    download.status = DownloadStatus.PAUSED
+                    
+                    # Save current download state and chunk progress
+                    download._chunked_download_state = {
+                        "chunk_boundaries": chunk_boundaries,
+                        "chunk_progress": chunk_progress.copy(),
+                        "temp_dir": temp_dir
+                    }
+                    
+                    await self.save_and_broadcast_download(download_id, "pause")
                     await self._recalculate_bandwidth_allocation()
-                    return
-
-        # This should not be reached in normal operation
-        print(f"Download {download_id} exited unexpectedly")
+                    return True
+                else:
+                    pause_event.set()
+                    download.status = DownloadStatus.DOWNLOADING
+                    await self.save_and_broadcast_download(download_id, "resume")
+                    await self._recalculate_bandwidth_allocation()
+                    return True
+            else:
+                # Explicit pause/unpause
+                if paused:
+                    pause_event.clear()
+                    download.status = DownloadStatus.PAUSED
+                    
+                    # Save current download state and chunk progress
+                    download._chunked_download_state = {
+                        "chunk_boundaries": chunk_boundaries,
+                        "chunk_progress": chunk_progress.copy(),
+                        "temp_dir": temp_dir
+                    }
+                    
+                    await self.save_and_broadcast_download(download_id, "pause")
+                    await self._recalculate_bandwidth_allocation()
+                    return True
+                else:
+                    pause_event.set()
+                    download.status = DownloadStatus.DOWNLOADING
+                    await self.save_and_broadcast_download(download_id, "resume")
+                    await self._recalculate_bandwidth_allocation()
+                    return True
+        
+        # Set up cancel callback function
+        async def cancel_callback():
+            download.status = DownloadStatus.FAILED
+            await self.save_and_broadcast_download(download_id, "cancel")
+            await self._recalculate_bandwidth_allocation()
+            # Clean up temp files on cancellation
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"Error cleaning up temp directory: {e}")
+            return True
+        
+        # Set callbacks
+        download.pause_resume_callback = pause_resume_callback
+        download.cancel_callback = cancel_callback
+        
+        # Update download status
+        await self.save_and_broadcast_download(download_id)
+        await self._recalculate_bandwidth_allocation()
+        
+        try:
+            # Create tasks for downloading each chunk
+            chunk_tasks = []
+            
+            # Initialize chunk progress - either from saved state or fresh
+            if resuming_chunked and 'chunk_progress' in download._chunked_download_state:
+                # Use the saved progress
+                chunk_progress = list(download._chunked_download_state['chunk_progress'])
+                # Ensure list is right size
+                if len(chunk_progress) != len(chunk_boundaries):
+                    # Pad with zeros if necessary
+                    chunk_progress.extend([0] * (len(chunk_boundaries) - len(chunk_progress)))
+                print(f"Restored chunk progress: {sum(chunk_progress)}/{download.size} bytes")
+            else:
+                # Start fresh progress tracking
+                chunk_progress = [0] * len(chunk_boundaries)
+            
+            async def download_chunk(chunk_index, start_byte, end_byte):
+                chunk_file = os.path.join(temp_dir, f"chunk_{chunk_index}")
+                existing_progress = chunk_progress[chunk_index]
+                
+                # If this chunk is already complete, skip downloading
+                chunk_size = end_byte - start_byte + 1
+                if existing_progress == chunk_size and os.path.exists(chunk_file):
+                    chunk_file_size = os.path.getsize(chunk_file)
+                    if chunk_file_size == chunk_size:
+                        print(f"Chunk {chunk_index} already complete ({chunk_size} bytes), skipping")
+                        return True
+                
+                # If we have partial progress, adjust the range
+                if existing_progress > 0 and os.path.exists(chunk_file):
+                    adjusted_start = start_byte + existing_progress
+                    print(f"Resuming chunk {chunk_index} from position {adjusted_start} (skipping {existing_progress} bytes)")
+                    headers = {"Range": f"bytes={adjusted_start}-{end_byte}"}
+                    # Open file in append mode
+                    file_mode = 'ab'
+                else:
+                    # Start from beginning of chunk
+                    headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+                    # Open file in write mode
+                    file_mode = 'wb'
+                    # Reset progress for this chunk
+                    chunk_progress[chunk_index] = 0
+                
+                timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=60)
+                
+                # Handle retries for this chunk
+                retry_count = 0
+                max_retries = download.max_retries
+                
+                while retry_count <= max_retries:
+                    try:
+                        async with aiohttp.ClientSession(timeout=timeout) as session:
+                            async with session.get(current_url_to_try, headers=headers) as response:
+                                if response.status != 206:
+                                    print(f"Warning: Chunk {chunk_index} got status {response.status} instead of 206")
+                                    if response.status == 416:  # Range Not Satisfiable
+                                        # Try requesting the whole chunk again
+                                        headers = {"Range": f"bytes={start_byte}-{end_byte}"}
+                                        continue
+                                        
+                                # Open file using correct mode
+                                async with aiofiles.open(chunk_file, file_mode) as f:
+                                    chunk_size = 1048576  # 1MB read buffer
+                                    bytes_downloaded = 0
+                                    expected_size = end_byte - start_byte + 1
+                                    
+                                    # Read and write the chunk
+                                    async for data in response.content.iter_chunked(chunk_size):
+                                        # Check for pause
+                                        await pause_event.wait()
+                                        
+                                        # Check for cancellation
+                                        if download.status == DownloadStatus.FAILED:
+                                            return False
+                                        
+                                        # Write data
+                                        await f.write(data)
+                                        bytes_downloaded += len(data)
+                                        
+                                        # Update progress for this chunk
+                                        chunk_progress[chunk_index] = bytes_downloaded
+                                
+                                # Verify chunk size
+                                if bytes_downloaded != expected_size:
+                                    print(f"Warning: Chunk {chunk_index} size mismatch. Got {bytes_downloaded}, expected {expected_size}")
+                                    if bytes_downloaded < expected_size and retry_count < max_retries:
+                                        # Retry this chunk
+                                        retry_count += 1
+                                        continue
+                                
+                                return True  # Success
+                                
+                    except asyncio.CancelledError:
+                        print(f"Chunk {chunk_index} cancelled")
+                        return False
+                    except aiohttp.ClientError as e:
+                        print(f"Error downloading chunk {chunk_index}: {e}")
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            await asyncio.sleep(2**retry_count)  # Exponential backoff
+                        else:
+                            return False
+                    except Exception as e:
+                        print(f"Unexpected error downloading chunk {chunk_index}: {e}")
+                        retry_count += 1
+                        if retry_count <= max_retries:
+                            await asyncio.sleep(2**retry_count)
+                        else:
+                            return False
+            
+            # Initialize total progress tracking
+            total_progress = sum(chunk_progress)
+            download.size_downloaded = total_progress
+            download._last_total_progress = total_progress
+            
+            # Start downloading chunks
+            for i, (start, end) in enumerate(chunk_boundaries):
+                task = asyncio.create_task(download_chunk(i, start, end))
+                chunk_tasks.append(task)
+            
+            # Monitor progress while chunks are downloading
+            last_update_time = time.time()
+            
+            while chunk_tasks:
+                # Check for pause or cancel
+                if download.status == DownloadStatus.FAILED:
+                    for task in chunk_tasks:
+                        task.cancel()
+                    break
+                
+                # Check progress
+                current_time = time.time()
+                if current_time - last_update_time >= 1.0:  # Update once per second
+                    # Calculate total progress
+                    total_downloaded = sum(chunk_progress)
+                    download.size_downloaded = total_downloaded
+                    
+                    # Calculate speed and ETA
+                    time_diff = current_time - last_update_time
+                    if time_diff > 0:
+                        progress_diff = total_downloaded - download._last_total_progress
+                        download.speed = int(progress_diff / time_diff)
+                        
+                        # Calculate ETA
+                        if download.speed > 0:
+                            remaining_size = download.size - total_downloaded
+                            download.time_left = int(remaining_size / download.speed)
+                    
+                    # Save the progress for next calculation
+                    download._last_total_progress = total_downloaded
+                    last_update_time = current_time
+                    
+                    # Broadcast update
+                    await self._broadcast_download_update(download_id)
+                
+                # Check if any tasks have completed
+                done, pending = await asyncio.wait(chunk_tasks, timeout=0.5)
+                
+                # Process completed tasks
+                for task in done:
+                    try:
+                        success = await task
+                        if not success:
+                            # Cancel all remaining tasks if one fails
+                            print("Chunk download failed, cancelling remaining chunks")
+                            for remaining_task in pending:
+                                remaining_task.cancel()
+                            download.status = DownloadStatus.FAILED
+                            await self.save_and_broadcast_download(download_id, "error")
+                            return
+                    except Exception as e:
+                        print(f"Error in chunk task: {e}")
+                        download.status = DownloadStatus.FAILED
+                        await self.save_and_broadcast_download(download_id, "error")
+                        return
+                
+                # Update remaining tasks
+                chunk_tasks = list(pending)
+            
+            # If we reach here, all chunks completed or were cancelled
+            if download.status == DownloadStatus.FAILED:
+                print(f"Download {download_id} was cancelled during chunk download")
+                return
+            
+            # Combine chunks into the final file
+            print(f"All chunks downloaded, combining into final file: {download.save_path}")
+            try:
+                async with aiofiles.open(download.save_path, 'wb') as outfile:
+                    for i in range(len(chunk_boundaries)):
+                        chunk_file = os.path.join(temp_dir, f"chunk_{i}")
+                        if os.path.exists(chunk_file):
+                            async with aiofiles.open(chunk_file, 'rb') as infile:
+                                while True:
+                                    data = await infile.read(10485760)  # Read 10MB at a time
+                                    if not data:
+                                        break
+                                    await outfile.write(data)
+                
+                # Update download status
+                download.status = DownloadStatus.COMPLETED
+                download.size_downloaded = download.size
+                download.speed = 0
+                download.time_left = None
+                
+                # Clear callbacks
+                download.pause_resume_callback = None
+                download.cancel_callback = None
+                
+                # Final update
+                await self.save_and_broadcast_download(download_id, "complete")
+                await self._recalculate_bandwidth_allocation()
+                
+                # Send notification
+                await self._send_notification(
+                    download_id,
+                    "Download Complete",
+                    f"The download '{download.name}' has completed successfully.",
+                    "success"
+                )
+                
+            except Exception as e:
+                print(f"Error combining chunks: {e}")
+                download.status = DownloadStatus.FAILED
+                download.notes = f"Error combining chunks: {e}"
+                await self.save_and_broadcast_download(download_id, "error")
+        
+        finally:
+            # Clean up temp directory
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"Error cleaning up temp directory: {e}")
 
     async def _download_youtube(self, download_id: str) -> None:
         """Download a YouTube video using yt-dlp with pause/resume functionality"""
@@ -2410,6 +3074,29 @@ class DownloadManager:
         if not download or download.status != DownloadStatus.DOWNLOADING:
             return None
 
+        # First try to use the pause_resume_callback if available
+        # This supports both regular and chunked downloads that implement their own pause logic
+        if download.pause_resume_callback:
+            try:
+                print(f"Using pause callback for download {download_id}")
+                if asyncio.iscoroutinefunction(download.pause_resume_callback):
+                    result = await download.pause_resume_callback(paused=True)
+                else:
+                    result = download.pause_resume_callback(paused=True)
+                    
+                # If callback succeeded, we're done
+                if result:
+                    # Even though the callback should have updated the status,
+                    # let's make sure it's set correctly
+                    if download.status != DownloadStatus.PAUSED:
+                        download.status = DownloadStatus.PAUSED
+                        await self._broadcast_download_update(download_id)
+                    return download
+            except Exception as e:
+                print(f"Error using pause callback: {e}")
+                # Continue with legacy pause method if callback fails
+
+        # Legacy method - cancel the task
         task = self.tasks.get(download_id)
         if task:
             task.cancel()
@@ -2467,7 +3154,24 @@ class DownloadManager:
             print("Can't resume scheduled download, will start at its scheduled time")
             return download
 
-        # Set status to QUEUED
+        # If the download has a pause_resume_callback, use it directly
+        # This handles in-memory paused downloads without restarting them
+        if download.status == DownloadStatus.PAUSED and download.pause_resume_callback:
+            try:
+                print(f"Using existing pause/resume callback for download {download_id}")
+                if asyncio.iscoroutinefunction(download.pause_resume_callback):
+                    result = await download.pause_resume_callback(paused=False)
+                else:
+                    result = download.pause_resume_callback(paused=False)
+                    
+                # If the callback was successful, we're done
+                if result:
+                    return download
+            except Exception as e:
+                print(f"Error using existing pause/resume callback: {e}")
+                # Continue with standard resume process below if callback fails
+        
+        # Set status to QUEUED for restarting the download
         download.status = DownloadStatus.QUEUED
 
         # If there's an existing task, cancel it before starting a new one
@@ -2475,7 +3179,8 @@ class DownloadManager:
             print(f"Cancelling existing task for download {download_id}")
             try:
                 self.tasks[download_id].cancel()
-                await asyncio.sleep(0.1)  # Give it a moment to clean up
+                # Give it a moment to clean up
+                await asyncio.sleep(0.1)
             except Exception as e:
                 print(f"Error cancelling existing task: {e}")
 
